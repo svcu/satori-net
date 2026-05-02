@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/net_core", "crates/cli", "crates/node", "crates/bootstrap"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Sergio"]
+repository = "https://github.com/svcu2310/satori-net"
+homepage = "https://github.com/svcu2310/satori-net"
+
+[workspace.dependencies]
+x25519-dalek = { version = "2", features = ["getrandom", "static_secrets"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }

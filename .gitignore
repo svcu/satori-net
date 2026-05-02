@@ -1,0 +1,27 @@
+# Build output
+/target
+**/target/
+
+# Cargo lock for libraries (keep for binaries/workspace)
+# Cargo.lock  # uncomment if this is a library-only crate
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.local
+
+# Claude Code
+.claude/settings.local.json

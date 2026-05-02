@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"D:\\\\satori-net\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(cargo build *)"
+    ]
+  }
+}
