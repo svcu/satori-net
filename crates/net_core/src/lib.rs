@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use reqwest::Response;
@@ -112,24 +113,12 @@ impl Node {
     /// Fetches the peer list from the bootstrap server at `bootstrap` and merges it
     /// into this node's local peer set.
     pub async fn get_peers(&mut self, bootstrap: &str) {
-        let Ok(response) = reqwest::Client::new()
-            .get(endpoint(bootstrap, "peers"))
-            .send()
-            .await
-        else {
-            return;
-        };
-        let Ok(addrs) = response.json::<HashSet<SocketAddr>>().await else {
-            return;
-        };
-        self.peers.write().await.extend(addrs);
+        fetch_and_merge_peers(bootstrap, &self.peers).await;
     }
 
-    /// Binds the listening socket, registers with the default bootstrap server, fetches
-    /// the initial peer list, and spawns a background task to accept inbound connections.
-    ///
-    /// Each accepted connection performs an X25519 handshake and is stored in the
-    /// session table. Received messages are printed to stdout.
+    /// Binds the listening socket, registers with the bootstrap server, and spawns two
+    /// background tasks: one that accepts inbound connections and one that refreshes the
+    /// peer list from the bootstrap server every 30 seconds.
     pub async fn listen(&mut self) {
         let bind_addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&bind_addr)
@@ -137,10 +126,33 @@ impl Node {
             .expect("failed to bind listener");
 
         self.register("http://127.0.0.1:1815").await.ok();
-        self.get_peers("http://127.0.0.1:1815").await;
 
         let sessions = self.sessions.clone();
+        let peers = self.peers.clone();
         tokio::spawn(accept_loop(listener, sessions));
+        tokio::spawn(peer_refresh_loop("http://127.0.0.1:1815".to_owned(), peers));
+    }
+}
+
+async fn fetch_and_merge_peers(bootstrap: &str, peers: &Arc<RwLock<HashSet<SocketAddr>>>) {
+    let Ok(response) = reqwest::Client::new()
+        .get(endpoint(bootstrap, "peers"))
+        .send()
+        .await
+    else {
+        return;
+    };
+    let Ok(addrs) = response.json::<HashSet<SocketAddr>>().await else {
+        return;
+    };
+    peers.write().await.extend(addrs);
+}
+
+async fn peer_refresh_loop(bootstrap: String, peers: Arc<RwLock<HashSet<SocketAddr>>>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        fetch_and_merge_peers(&bootstrap, &peers).await;
     }
 }
 

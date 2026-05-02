@@ -42,7 +42,7 @@ async fn register(
     StatusCode::OK
 }
 
-async fn list_peers(State(state): State<AppState>) -> Json<Vec<SocketAddr>> {
-    let peers = state.peers.read().unwrap().iter().copied().collect();
+async fn list_peers(State(state): State<AppState>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Json<Vec<SocketAddr>> {
+    let peers = state.peers.read().unwrap().iter().filter(|x|**x!=addr).cloned().collect();
     Json(peers)
 }
