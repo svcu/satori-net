@@ -34,7 +34,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use reqwest::Response;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tun_rs::{AsyncDevice, DeviceBuilder};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 /// Errors produced by node and session operations.
@@ -50,6 +51,8 @@ pub enum Error {
     ConnectionClosed,
     #[error("invalid handshake frame")]
     InvalidHandshake,
+    #[error("nonexistent sessions")]
+    NonExistentSession,
 }
 
 /// An encrypted point-to-point connection between two peers.
@@ -73,23 +76,44 @@ pub struct Session {
 /// socket, register with the bootstrap server, and start accepting connections in the
 /// background.
 pub struct Node {
-    sessions: Arc<RwLock<HashMap<SocketAddr, Session>>>,
+    sessions: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<Session>>>>>,
     #[allow(dead_code)] // reserved for long-term identity key support
     identity: StaticSecret,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
     port: u16,
+    dev: Arc<AsyncDevice>
 }
 
 impl Node {
     /// Creates a new node that will listen on `port`.
     ///
     /// The node is not yet bound or registered; call [`listen`](Node::listen) to start it.
-    pub fn new(port: u16) -> Self {
+    pub fn new(port: u16, ip: &str) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             identity: StaticSecret::random(),
             peers: Arc::new(RwLock::new(HashSet::new())),
             port,
+            dev: Arc::new(DeviceBuilder::new().ipv4(ip, 24, None).build_async().unwrap())
+        }
+    }
+
+    pub fn get_tun(&mut self) -> Arc<AsyncDevice>{
+        self.dev.clone()
+    }
+
+    pub async fn connect(&mut self, addr: SocketAddr) -> Result<(), Error> {
+        let session = Session::connect(addr).await?;
+        self.sessions.write().await.insert(addr, Arc::new(Mutex::new(session)));
+        self.peers.write().await.insert(addr);
+        Ok(())
+    }
+
+    pub async fn send_to(&mut self, addr: &SocketAddr, data: &[u8]) -> Result<(), Error> {
+        let session = self.sessions.read().await.get(addr).cloned();
+        match session {
+            None => Err(Error::NonExistentSession),
+            Some(s) => s.lock().await.send(data).await,
         }
     }
 
@@ -129,7 +153,7 @@ impl Node {
 
         let sessions = self.sessions.clone();
         let peers = self.peers.clone();
-        tokio::spawn(accept_loop(listener, sessions));
+        tokio::spawn(accept_loop(listener, sessions, self.dev.clone()));
         tokio::spawn(peer_refresh_loop("http://127.0.0.1:1815".to_owned(), peers));
     }
 }
@@ -156,24 +180,22 @@ async fn peer_refresh_loop(bootstrap: String, peers: Arc<RwLock<HashSet<SocketAd
     }
 }
 
-async fn accept_loop(listener: TcpListener, sessions: Arc<RwLock<HashMap<SocketAddr, Session>>>) {
+async fn accept_loop(listener: TcpListener, sessions: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<Session>>>>>, dev: Arc<AsyncDevice>) {
+    let dv = dev.clone();
     loop {
         let Ok((stream, peer_addr)) = listener.accept().await else {
             continue;
         };
 
         let sessions = sessions.clone();
+        let v = dv.clone();
         tokio::spawn(async move {
             match handshake_incoming(stream, peer_addr).await {
                 Ok(session) => {
-                    sessions.write().await.insert(peer_addr, session);
-                    // NOTE: holds the write lock for the lifetime of this connection.
-                    // Replace HashMap<_, Session> with HashMap<_, Arc<Mutex<Session>>>
-                    // to allow concurrent reads from other tasks.
-                    let mut guard = sessions.write().await;
-                    if let Some(session) = guard.get_mut(&peer_addr) {
-                        recv_loop(session, peer_addr).await;
-                    }
+                    let session = Arc::new(Mutex::new(session));
+                    sessions.write().await.insert(peer_addr, session.clone());
+                    recv_loop(session, peer_addr, v).await;
+                    sessions.write().await.remove(&peer_addr);
                 }
                 Err(e) => eprintln!("[satori-net] handshake failed with {peer_addr}: {e}"),
             }
@@ -204,10 +226,15 @@ async fn handshake_incoming(mut stream: TcpStream, peer_addr: SocketAddr) -> Res
     })
 }
 
-async fn recv_loop(session: &mut Session, peer_addr: SocketAddr) {
+async fn recv_loop(session: Arc<Mutex<Session>>, peer_addr: SocketAddr, dev: Arc<AsyncDevice>) {
     loop {
-        match session.recv().await {
-            Ok(data) => println!("[{peer_addr}] {}", String::from_utf8_lossy(&data)),
+        match session.lock().await.recv().await {
+            Ok(data) => {
+                if let Err(e) = dev.send(&data).await {
+                    eprintln!("[satori-net] TUN write error: {e}");
+                    break;
+                }
+            }
             Err(Error::ConnectionClosed) => {
                 eprintln!("[satori-net] {peer_addr} disconnected");
                 break;
