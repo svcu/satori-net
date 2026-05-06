@@ -14,24 +14,24 @@
 //! use net_core::{Node, Session};
 //!
 //! #[tokio::main]
-//! async fn main() {
-//!     let mut node = Node::new(1812);
-//!     node.listen().await;
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut node = Node::new(1812, "10.0.0.1")?;
+//!     node.listen("http://localhost:1815").await?;
 //!
 //!     if let Some(&addr) = node.list_peers().await.first() {
-//!         let mut session = Session::connect(addr).await.expect("failed to connect");
-//!         session.send(b"hello").await.unwrap();
+//!         let mut session = Session::connect(addr).await?;
+//!         session.send(b"hello").await?;
 //!     }
+//!     Ok(())
 //! }
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
-use reqwest::Response;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
@@ -51,8 +51,12 @@ pub enum Error {
     ConnectionClosed,
     #[error("invalid handshake frame")]
     InvalidHandshake,
-    #[error("nonexistent sessions")]
-    NonExistentSession,
+    #[error("no active session for that address")]
+    NoSession,
+    #[error("TUN device error: {0}")]
+    Tun(String),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 /// An encrypted point-to-point connection between two peers.
@@ -81,27 +85,36 @@ pub struct Node {
     identity: StaticSecret,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
     port: u16,
-    dev: Arc<AsyncDevice>
+    public_addr: Arc<RwLock<Option<SocketAddr>>>,
+    tun: Arc<AsyncDevice>,
 }
 
 impl Node {
-    /// Creates a new node that will listen on `port`.
+    /// Creates a new node that will listen on `port` and expose a TUN interface at `tun_ip`.
     ///
     /// The node is not yet bound or registered; call [`listen`](Node::listen) to start it.
-    pub fn new(port: u16, ip: &str) -> Self {
-        Self {
+    pub fn new(port: u16, tun_ip: &str) -> Result<Self, Error> {
+        let tun = DeviceBuilder::new()
+            .ipv4(tun_ip, 24, None)
+            .build_async()
+            .map_err(|e| Error::Tun(e.to_string()))?;
+
+        Ok(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             identity: StaticSecret::random(),
             peers: Arc::new(RwLock::new(HashSet::new())),
             port,
-            dev: Arc::new(DeviceBuilder::new().ipv4(ip, 24, None).build_async().unwrap())
-        }
+            public_addr: Arc::new(RwLock::new(None)),
+            tun: Arc::new(tun),
+        })
     }
 
-    pub fn get_tun(&mut self) -> Arc<AsyncDevice>{
-        self.dev.clone()
+    /// Returns a handle to the underlying TUN device.
+    pub fn tun(&self) -> Arc<AsyncDevice> {
+        self.tun.clone()
     }
 
+    /// Opens an encrypted session to `addr` and registers it in the session table.
     pub async fn connect(&mut self, addr: SocketAddr) -> Result<(), Error> {
         let session = Session::connect(addr).await?;
         self.sessions.write().await.insert(addr, Arc::new(Mutex::new(session)));
@@ -109,11 +122,12 @@ impl Node {
         Ok(())
     }
 
+    /// Encrypts `data` and sends it to the session identified by `addr`.
     pub async fn send_to(&mut self, addr: &SocketAddr, data: &[u8]) -> Result<(), Error> {
         let session = self.sessions.read().await.get(addr).cloned();
         match session {
-            None => Err(Error::NonExistentSession),
             Some(s) => s.lock().await.send(data).await,
+            None => Err(Error::NoSession),
         }
     }
 
@@ -124,43 +138,75 @@ impl Node {
 
     /// Registers this node with the bootstrap server at `bootstrap`.
     ///
-    /// Sends `POST /register` with this node's listening port. The server records
-    /// the caller's IP and the supplied port as the node's public address.
-    pub async fn register(&mut self, bootstrap: &str) -> Result<Response, reqwest::Error> {
-        reqwest::Client::new()
-            .post(endpoint(bootstrap, "register"))
-            .json(&self.port)
+    /// Discovers the node's public IP via `api.ipify.org`, then sends
+    /// `POST /register` with the full `SocketAddr` (public IP + listening port).
+    pub async fn register(&mut self, bootstrap: &str) -> Result<(), Error> {
+        let client = reqwest::Client::new();
+
+        #[derive(serde::Deserialize)]
+        struct IpResponse {
+            ip: IpAddr,
+        }
+
+        let public_ip = client
+            .get("https://api.ipify.org?format=json")
             .send()
-            .await
+            .await?
+            .json::<IpResponse>()
+            .await?
+            .ip;
+
+        let addr = SocketAddr::new(public_ip, self.port);
+        *self.public_addr.write().await = Some(addr);
+
+        client
+            .post(endpoint(bootstrap, "register"))
+            .json(&addr)
+            .send()
+            .await?;
+
+        Ok(())
     }
 
-    /// Fetches the peer list from the bootstrap server at `bootstrap` and merges it
-    /// into this node's local peer set.
+    /// Fetches the peer list from the bootstrap server and merges it into the local peer set.
     pub async fn get_peers(&mut self, bootstrap: &str) {
-        fetch_and_merge_peers(bootstrap, &self.peers).await;
+        if let Some(addr) = *self.public_addr.read().await {
+            fetch_and_merge_peers(bootstrap, addr, &self.peers).await;
+        }
     }
 
     /// Binds the listening socket, registers with the bootstrap server, and spawns two
     /// background tasks: one that accepts inbound connections and one that refreshes the
     /// peer list from the bootstrap server every 30 seconds.
-    pub async fn listen(&mut self) {
+    pub async fn listen(&mut self, bootstrap: &str) -> Result<(), Error> {
         let bind_addr = format!("0.0.0.0:{}", self.port);
-        let listener = TcpListener::bind(&bind_addr)
+        let listener = TcpListener::bind(&bind_addr).await?;
+
+        if let Err(e) = self.register(bootstrap).await {
+            tracing::warn!("bootstrap registration failed: {e}");
+        }
+
+        let self_addr = self
+            .public_addr
+            .read()
             .await
-            .expect("failed to bind listener");
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), self.port));
 
-        self.register("http://127.0.0.1:1815").await.ok();
+        tokio::spawn(accept_loop(listener, self.sessions.clone(), self.tun.clone()));
+        tokio::spawn(peer_refresh_loop(bootstrap.to_owned(), self_addr, self.peers.clone()));
 
-        let sessions = self.sessions.clone();
-        let peers = self.peers.clone();
-        tokio::spawn(accept_loop(listener, sessions, self.dev.clone()));
-        tokio::spawn(peer_refresh_loop("http://127.0.0.1:1815".to_owned(), peers));
+        Ok(())
     }
 }
 
-async fn fetch_and_merge_peers(bootstrap: &str, peers: &Arc<RwLock<HashSet<SocketAddr>>>) {
+async fn fetch_and_merge_peers(
+    bootstrap: &str,
+    self_addr: SocketAddr,
+    peers: &Arc<RwLock<HashSet<SocketAddr>>>,
+) {
     let Ok(response) = reqwest::Client::new()
         .get(endpoint(bootstrap, "peers"))
+        .query(&[("addr", self_addr.to_string())])
         .send()
         .await
     else {
@@ -172,32 +218,39 @@ async fn fetch_and_merge_peers(bootstrap: &str, peers: &Arc<RwLock<HashSet<Socke
     peers.write().await.extend(addrs);
 }
 
-async fn peer_refresh_loop(bootstrap: String, peers: Arc<RwLock<HashSet<SocketAddr>>>) {
+async fn peer_refresh_loop(
+    bootstrap: String,
+    self_addr: SocketAddr,
+    peers: Arc<RwLock<HashSet<SocketAddr>>>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         interval.tick().await;
-        fetch_and_merge_peers(&bootstrap, &peers).await;
+        fetch_and_merge_peers(&bootstrap, self_addr, &peers).await;
     }
 }
 
-async fn accept_loop(listener: TcpListener, sessions: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<Session>>>>>, dev: Arc<AsyncDevice>) {
-    let dv = dev.clone();
+async fn accept_loop(
+    listener: TcpListener,
+    sessions: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<Session>>>>>,
+    tun: Arc<AsyncDevice>,
+) {
     loop {
         let Ok((stream, peer_addr)) = listener.accept().await else {
             continue;
         };
 
         let sessions = sessions.clone();
-        let v = dv.clone();
+        let tun = tun.clone();
         tokio::spawn(async move {
             match handshake_incoming(stream, peer_addr).await {
                 Ok(session) => {
                     let session = Arc::new(Mutex::new(session));
                     sessions.write().await.insert(peer_addr, session.clone());
-                    recv_loop(session, peer_addr, v).await;
+                    recv_loop(session, peer_addr, tun).await;
                     sessions.write().await.remove(&peer_addr);
                 }
-                Err(e) => eprintln!("[satori-net] handshake failed with {peer_addr}: {e}"),
+                Err(e) => tracing::error!("handshake failed with {peer_addr}: {e}"),
             }
         });
     }
@@ -226,21 +279,23 @@ async fn handshake_incoming(mut stream: TcpStream, peer_addr: SocketAddr) -> Res
     })
 }
 
-async fn recv_loop(session: Arc<Mutex<Session>>, peer_addr: SocketAddr, dev: Arc<AsyncDevice>) {
+// Receives encrypted packets from a peer and forwards them to the TUN device.
+// Outbound routing (TUN → peer) is handled by the CLI's run_tun loop.
+async fn recv_loop(session: Arc<Mutex<Session>>, peer_addr: SocketAddr, tun: Arc<AsyncDevice>) {
     loop {
         match session.lock().await.recv().await {
             Ok(data) => {
-                if let Err(e) = dev.send(&data).await {
-                    eprintln!("[satori-net] TUN write error: {e}");
+                if let Err(e) = tun.send(&data).await {
+                    tracing::error!("TUN write error from {peer_addr}: {e}");
                     break;
                 }
             }
             Err(Error::ConnectionClosed) => {
-                eprintln!("[satori-net] {peer_addr} disconnected");
+                tracing::info!("{peer_addr} disconnected");
                 break;
             }
             Err(e) => {
-                eprintln!("[satori-net] session error from {peer_addr}: {e}");
+                tracing::error!("session error from {peer_addr}: {e}");
                 break;
             }
         }
@@ -308,7 +363,10 @@ impl Session {
     /// The counter is incremented on success.
     pub fn decrypt(&mut self, ciphertext: Vec<u8>) -> Result<Vec<u8>, Error> {
         let nonce = counter_nonce(self.recv_nonce);
-        let plaintext = self.cipher.decrypt(&nonce, ciphertext.as_slice()).map_err(|_| Error::Decrypt)?;
+        let plaintext = self
+            .cipher
+            .decrypt(&nonce, ciphertext.as_slice())
+            .map_err(|_| Error::Decrypt)?;
         self.recv_nonce += 1;
         Ok(plaintext)
     }
@@ -331,7 +389,10 @@ fn endpoint(base: &str, path: &str) -> String {
 }
 
 /// Writes a length-prefixed frame to `stream`: `[u32 big-endian length][payload]`.
-pub async fn write_frame<T: AsyncWrite + Unpin>(stream: &mut T, payload: &[u8]) -> Result<(), std::io::Error> {
+pub async fn write_frame<T: AsyncWrite + Unpin>(
+    stream: &mut T,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
     stream.write_u32(payload.len() as u32).await?;
     stream.write_all(payload).await
 }
@@ -342,7 +403,9 @@ pub async fn write_frame<T: AsyncWrite + Unpin>(stream: &mut T, payload: &[u8]) 
 pub async fn read_frame<T: AsyncRead + Unpin>(stream: &mut T) -> Result<Vec<u8>, Error> {
     let length = match stream.read_u32().await {
         Ok(n) => n,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Error::ConnectionClosed),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(Error::ConnectionClosed);
+        }
         Err(e) => return Err(Error::Io(e)),
     };
     let mut payload = vec![0u8; length as usize];

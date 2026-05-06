@@ -1,46 +1,35 @@
 # Contributing to satori-net
 
-Thank you for your interest in contributing!
+Thank you for your interest in contributing! This project is in early development, so please open an issue to discuss any significant change before submitting a pull request.
 
 ## Getting Started
 
 1. Fork the repository and clone your fork.
-2. Install the Rust toolchain via [rustup](https://rustup.rs/).
-3. Build the workspace:
-   ```sh
-   cargo build --workspace
-   ```
-4. Run the tests:
-   ```sh
-   cargo test --workspace
-   ```
+2. Make sure you have Rust 1.85+ installed (`rustup show`).
+3. Build the workspace: `cargo build --workspace`
+4. Run `cargo clippy --workspace` and `cargo fmt --check` before submitting.
 
-## Development Workflow
+## Pull Request Guidelines
 
-- Create a feature branch from `main`.
-- Keep commits focused and well-described.
-- Run `cargo clippy --workspace` and resolve any warnings before opening a PR.
-- Run `cargo fmt --all` to ensure consistent formatting.
-
-## Submitting a Pull Request
-
-1. Open a PR against `main` with a clear title and description of the change.
-2. Reference any related issues.
-3. Ensure CI passes.
+- Keep PRs focused — one logical change per PR.
+- Write clear commit messages that explain *why*, not just *what*.
+- If your change touches the public API of `net_core`, update the doc comments and the API table in the README.
+- All CI checks must pass.
 
 ## Reporting Issues
 
-Please use GitHub Issues for bug reports and feature requests. Include:
-- Rust version (`rustc --version`)
-- Operating system
-- Steps to reproduce
-- Expected vs actual behavior
+Please include:
+- Your OS and Rust version (`rustc --version`).
+- The exact command you ran and the full error output.
+- Steps to reproduce.
 
 ## Code Style
 
-- Follow standard Rust idioms and the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
-- Document all public items with doc comments (`///`).
-- Prefer `?` over `.unwrap()` in library code.
+- Format with `cargo fmt`.
+- Lint with `cargo clippy -- -D warnings`.
+- No `unwrap()` in library code (`net_core`) — propagate errors with `?`.
+- No debug `println!` — use `tracing` macros.
+- No comments that explain *what* the code does; only add one when the *why* is non-obvious.
 
 ## License
 

@@ -4,10 +4,11 @@ use std::sync::{Arc, RwLock};
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
 };
+use serde::Deserialize;
 
 #[derive(Clone)]
 struct AppState {
@@ -15,7 +16,11 @@ struct AppState {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let state = AppState {
         peers: Arc::new(RwLock::new(HashSet::new())),
     };
@@ -25,24 +30,36 @@ async fn main() {
         .route("/peers", get(list_peers))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:1815").await.unwrap();
-    println!("bootstrap server listening on 0.0.0.0:1815");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .unwrap();
+    let addr = "0.0.0.0:1815";
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("bootstrap server listening on {addr}");
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-async fn register(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(port): Json<u16>,
-) -> StatusCode {
-    let peer = SocketAddr::new(addr.ip(), port);
-    state.peers.write().unwrap().insert(peer);
+async fn register(State(state): State<AppState>, Json(addr): Json<SocketAddr>) -> StatusCode {
+    state.peers.write().unwrap().insert(addr);
+    tracing::info!("registered peer: {addr}");
     StatusCode::OK
 }
 
-async fn list_peers(State(state): State<AppState>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Json<Vec<SocketAddr>> {
-    let peers = state.peers.read().unwrap().iter().filter(|x|**x!=addr).cloned().collect();
+#[derive(Deserialize)]
+struct PeersQuery {
+    addr: SocketAddr,
+}
+
+async fn list_peers(
+    State(state): State<AppState>,
+    Query(query): Query<PeersQuery>,
+) -> Json<Vec<SocketAddr>> {
+    let peers = state
+        .peers
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|&&x| x != query.addr)
+        .cloned()
+        .collect();
     Json(peers)
 }

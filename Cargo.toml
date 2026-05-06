@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/net_core", "crates/cli", "crates/node", "crates/bootstrap"]
+members = ["crates/net_core", "crates/cli", "crates/bootstrap"]
 resolver = "2"
 
 [workspace.package]
@@ -14,3 +14,5 @@ homepage = "https://github.com/svcu2310/satori-net"
 x25519-dalek = { version = "2", features = ["getrandom", "static_secrets"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
